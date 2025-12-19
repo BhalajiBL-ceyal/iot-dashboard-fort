@@ -28,7 +28,7 @@ DEVICE_IDS = [
     "ESP32_SIM_03"
 ]
 
-SEND_INTERVAL = 2  # seconds
+SEND_INTERVAL = 0.5  # seconds
 
 # Define your telemetry schema here - completely arbitrary!
 # This simulates a multi-sensor IoT device
@@ -103,7 +103,7 @@ class ESP32Simulator:
         payload = {
             "device_id": self.device_id,
             "telemetry": telemetry,
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.utcnow().isoformat()  # ISO format required by backend
         }
         
         try:

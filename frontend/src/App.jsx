@@ -6,6 +6,7 @@ import 'react-grid-layout/css/styles.css';
 import 'react-resizable/css/styles.css';
 import { AdvancedLineChart, BarChartWidget, ScatterPlotWidget, MultiStreamChart } from './AdvancedCharts';
 import { PinMappingWidget, PinReferenceWidget } from './ESP32PinWidget';
+import MachineStateIndicator from './components/MachineStateIndicator';
 
 // ==================== WEBSOCKET HOOK ====================
 const useWebSocket = (url) => {
@@ -258,6 +259,84 @@ const ProgressBar = ({ value, label, deviceId, max = 100, customTitle, isDarkMod
   );
 };
 
+// ==================== DEVICE CONTROL WIDGET ====================
+const DeviceControlWidget = ({ deviceId, customTitle, isDarkMode }) => {
+  const [isEnabled, setIsEnabled] = React.useState(true);
+  const [isSending, setIsSending] = React.useState(false);
+
+  const toggleDevice = async () => {
+    const newState = !isEnabled;
+    setIsSending(true);
+
+    try {
+      // Send control command to backend
+      const response = await fetch('http://localhost:8000/api/control', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          device_id: deviceId,
+          command: 'set_power',
+          value: newState ? 'on' : 'off'
+        })
+      });
+
+      if (response.ok) {
+        setIsEnabled(newState);
+      } else {
+        alert('Failed to control device');
+      }
+    } catch (error) {
+      console.error('Control error:', error);
+      alert('Could not reach backend');
+    } finally {
+      setIsSending(false);
+    }
+  };
+
+  return (
+    <div className={`h-full w-full rounded-lg shadow-md hover:shadow-lg transition-shadow border ${isDarkMode ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'}`}>
+      <div className={`p-4 border-b text-center ${isDarkMode ? 'border-gray-700' : 'border-gray-100'}`}>
+        <div className={`text-lg font-bold ${isDarkMode ? 'text-gray-200' : 'text-gray-700'}`}>
+          {customTitle || 'Device Control'}
+        </div>
+        <div className={`text-base ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>{deviceId}</div>
+      </div>
+
+      <div className="p-6 flex flex-col items-center justify-center h-[calc(100%-80px)]">
+        {/* Status Display */}
+        <div className={`text-6xl font-bold mb-6 ${isEnabled ? 'text-green-500' : 'text-red-500'}`}>
+          {isEnabled ? 'ON' : 'OFF'}
+        </div>
+
+        {/* Toggle Switch */}
+        <button
+          onClick={toggleDevice}
+          disabled={isSending}
+          className={`relative inline-flex h-16 w-32 items-center rounded-full transition-colors focus:outline-none focus:ring-4 ${isEnabled
+            ? 'bg-green-500 focus:ring-green-300'
+            : isDarkMode ? 'bg-gray-600 focus:ring-gray-500' : 'bg-gray-300 focus:ring-gray-200'
+            } ${isSending ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
+        >
+          <span
+            className={`inline-block h-12 w-12 transform rounded-full bg-white shadow-lg transition-transform ${isEnabled ? 'translate-x-16' : 'translate-x-2'
+              }`}
+          />
+        </button>
+
+        {/* State Label */}
+        <div className={`mt-6 text-xl font-semibold ${isDarkMode ? 'text-gray-300' : 'text-gray-700'}`}>
+          {isSending ? 'Sending...' : isEnabled ? 'Device Running' : 'Device Stopped'}
+        </div>
+
+        {/* Instructions */}
+        <div className={`mt-4 text-sm text-center ${isDarkMode ? 'text-gray-500' : 'text-gray-400'}`}>
+          Click to {isEnabled ? 'stop' : 'start'} the device
+        </div>
+      </div>
+    </div>
+  );
+};
+
 // Additional widgets simplified for brevity
 const AlarmWidget = ({ value, label, deviceId, threshold, customTitle }) => {
   const isAlarm = value >= threshold;
@@ -423,7 +502,7 @@ const WidgetSettingsModal = ({ widget, onSave, onClose, isDarkMode }) => {
 };
 
 // ==================== WIDGET RENDERER ====================
-const WidgetRenderer = ({ widget, telemetryData, devices, isDarkMode }) => {
+const WidgetRenderer = ({ widget, telemetryData, devices, machineStates, isDarkMode }) => {
   const deviceId = widget.bind ? widget.bind.split('.')[0] : widget.deviceId;
   const key = widget.bind ? widget.bind.split('.')[1] : null;
   const value = telemetryData[deviceId]?.[key]?.value;
@@ -480,6 +559,16 @@ const WidgetRenderer = ({ widget, telemetryData, devices, isDarkMode }) => {
       return <PinMappingWidget deviceId={deviceId} telemetryData={telemetryData} {...commonProps} />;
     case 'pin_reference':
       return <PinReferenceWidget isDarkMode={isDarkMode} />;
+    case 'machine_state':
+      const machineState = machineStates?.[deviceId];
+      return (
+        <MachineStateIndicator
+          state={machineState?.state || 'UNKNOWN'}
+          confidence={machineState?.confidence}
+          reasons={machineState?.reasons}
+          isDarkMode={isDarkMode}
+        />
+      );
     default:
       return null;
   }
@@ -510,6 +599,7 @@ export default function IoTDashboard() {
   const [pendingWidget, setPendingWidget] = useState(null);
   const [showMetricSelector, setShowMetricSelector] = useState(false);
   const [pendingMultiMetricDevice, setPendingMultiMetricDevice] = useState(null);
+  const [machineStates, setMachineStates] = useState({}); // Track machine states
   const [zoom, setZoom] = useState(1.0);
   const [containerWidth, setContainerWidth] = useState(1200);
   const containerRef = useRef(null);
@@ -521,6 +611,11 @@ export default function IoTDashboard() {
   const [historyIndex, setHistoryIndex] = useState(0);
   const [showWidgetSettings, setShowWidgetSettings] = useState(null);
 
+  // MOBILE RESPONSIVENESS
+  const [isMobile, setIsMobile] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [isDragging, setIsDragging] = useState(false);
+
   // MULTI-DASHBOARD STATE
   const [dashboards, setDashboards] = useState([
     { id: 'default', name: 'Main Dashboard', widgets: [], createdAt: Date.now() }
@@ -529,8 +624,12 @@ export default function IoTDashboard() {
   const [showDashboardModal, setShowDashboardModal] = useState(false);
   const [dashboardName, setDashboardName] = useState('');
 
-  const API_BASE = 'http://localhost:8000';
-  const WS_URL = 'ws://localhost:8000/ws/live';
+  const protocolHTTP = window.location.protocol;
+  const host = window.location.hostname;
+
+  const API_BASE = `${protocolHTTP}//${host}:8000`;
+  const WS_URL = `${protocolHTTP === 'https:' ? 'wss' : 'ws'}://${host}:8000/ws/live`;
+
 
   const { data: wsData, isConnected } = useWebSocket(WS_URL);
 
@@ -552,6 +651,19 @@ export default function IoTDashboard() {
         console.error('Failed to load dashboard:', e);
       }
     }
+
+    // Detect mobile screen size
+    const checkMobile = () => {
+      setIsMobile(window.innerWidth < 768);
+      if (window.innerWidth < 768) {
+        setSidebarOpen(false); // Auto-close sidebar on mobile
+      }
+    };
+
+    checkMobile();
+    window.addEventListener('resize', checkMobile);
+
+    return () => window.removeEventListener('resize', checkMobile);
   }, []);
 
   // Handle WebSocket messages
@@ -568,6 +680,9 @@ export default function IoTDashboard() {
         if (!newData[device_id]) newData[device_id] = {};
 
         Object.entries(telemetry).forEach(([key, value]) => {
+          // Skip internal state fields from being stored as regular telemetry
+          if (key.startsWith('_')) return;
+
           if (!newData[device_id][key]) {
             newData[device_id][key] = { value, history: [] };
           }
@@ -581,6 +696,18 @@ export default function IoTDashboard() {
 
         return newData;
       });
+
+      // Extract machine state if present
+      if (telemetry._machine_state) {
+        setMachineStates(prev => ({
+          ...prev,
+          [device_id]: {
+            state: telemetry._machine_state,
+            confidence: telemetry._state_confidence,
+            reasons: telemetry._state_reasons
+          }
+        }));
+      }
 
       setDevices(prev => {
         const updated = [...prev];
@@ -636,6 +763,19 @@ export default function IoTDashboard() {
     setDraggedWidgetType(widgetType);
     e.dataTransfer.setData('text/plain', widgetType);
     e.dataTransfer.effectAllowed = 'copy';
+
+    // Auto-hide sidebar when dragging starts (both mobile and desktop)
+    setIsDragging(true);
+    setTimeout(() => setSidebarOpen(false), 100);
+  };
+
+  const handleDragEnd = () => {
+    // Re-show sidebar when dragging ends
+    setIsDragging(false);
+    // On mobile, keep sidebar closed; on desktop, reopen it
+    if (!isMobile) {
+      setTimeout(() => setSidebarOpen(true), 300);
+    }
   };
 
   const onGridDrop = (layout, item, e) => {
@@ -843,27 +983,73 @@ export default function IoTDashboard() {
     ? (typeof devices[0] === 'string' ? Object.keys(telemetryData[selectedDevice] || {}) : devices.find(d => d.device_id === selectedDevice)?.telemetry_keys || [])
     : [];
 
-  const layout = widgets.map(w => ({
-    i: w.id,
-    x: w.x ?? 0,
-    y: w.y ?? Infinity,
-    w: w.w ?? 4,
-    h: w.h ?? 4,
-    minW: w.minW ?? 2,
-    minH: w.minH ?? 2,
-  }));
+  // Adjust layout for mobile (single column)
+  const layout = widgets.map(w => {
+    if (isMobile) {
+      return {
+        i: w.id,
+        x: 0, // Single column on mobile
+        y: w.y ?? Infinity,
+        w: 12, // Full width on mobile
+        h: Math.max(w.h ?? 4, 3), // Minimum height for mobile
+        minW: 12,
+        minH: 3,
+      };
+    }
+    return {
+      i: w.id,
+      x: w.x ?? 0,
+      y: w.y ?? Infinity,
+      w: w.w ?? 4,
+      h: w.h ?? 4,
+      minW: w.minW ?? 2,
+      minH: w.minH ?? 2,
+    };
+  });
 
   return (
     <div className={`h-screen flex ${isDarkMode ? 'bg-gray-900' : 'bg-gray-50'}`}>
+      {/* Mobile Menu Button */}
+      {isMobile && (
+        <button
+          onClick={() => setSidebarOpen(!sidebarOpen)}
+          className={`fixed top-4 left-4 z-50 p-3 rounded-lg shadow-lg ${isDarkMode ? 'bg-gray-800' : 'bg-white'}`}
+          style={{ display: sidebarOpen ? 'none' : 'block' }}
+        >
+          <LayoutGrid size={24} className={isDarkMode ? 'text-gray-200' : 'text-gray-800'} />
+        </button>
+      )}
+
+      {/* Sidebar with auto-hide during drag */}
+      {isDragging && (
+        <div className={`fixed ${isMobile ? 'top-20' : 'top-1/2'} left-4 z-50 bg-blue-600 text-white px-4 py-2 rounded-full shadow-lg animate-pulse`}>
+          {isMobile ? 'Drop below ↓' : 'Drop widget on canvas →'}
+        </div>
+      )}
+
       {/* Sidebar */}
-      <div className={`w-72 flex flex-col shadow-xl overflow-hidden ${isDarkMode ? 'bg-gray-800 text-white' : 'bg-slate-800 text-white'}`}>
+      <div className={`${isMobile ? 'fixed inset-y-0 left-0 z-40 transform transition-transform duration-300' : 'relative'} ${isMobile && !sidebarOpen ? '-translate-x-full' : 'translate-x-0'} ${isMobile ? 'w-full sm:w-80' : 'w-72'} flex flex-col shadow-xl overflow-hidden ${isDarkMode ? 'bg-gray-800 text-white' : 'bg-slate-800 text-white'}`}>
+        {/* Sidebar Header */}
         <div className={`p-6 border-b ${isDarkMode ? 'border-gray-700' : 'border-slate-700'}`}>
-          <div className="flex items-center gap-3">
-            <Server size={28} className="text-blue-400" />
-            <div>
-              <h1 className="text-xl font-bold">IoT Dashboard</h1>
-              <p className="text-xs text-slate-400">Real-time Monitoring</p>
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <Server size={28} className="text-blue-400" />
+              <div>
+                <h1 className="text-xl font-bold">IoT Dashboard</h1>
+                <p className="text-xs text-slate-400">Real-time Monitoring</p>
+              </div>
             </div>
+            {isMobile && (
+              <button
+                onClick={() => setSidebarOpen(false)}
+                className="p-2 rounded hover:bg-slate-700"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <line x1="18" y1="6" x2="6" y2="18"></line>
+                  <line x1="6" y1="6" x2="18" y2="18"></line>
+                </svg>
+              </button>
+            )}
           </div>
         </div>
 
@@ -876,7 +1062,12 @@ export default function IoTDashboard() {
               {devices.map(device => (
                 <button
                   key={device.device_id}
-                  onClick={() => isEditMode && setSelectedDevice(device.device_id)}
+                  onClick={() => {
+                    if (isEditMode) {
+                      setSelectedDevice(device.device_id);
+                      if (isMobile) setSidebarOpen(false); // Auto-close on mobile after selection
+                    }
+                  }}
                   className={`w-full text-left p-3 rounded-lg transition-all ${selectedDevice === device.device_id ? 'bg-blue-600 shadow-lg' : isDarkMode ? 'bg-gray-700 hover:bg-gray-600' : 'bg-slate-700 hover:bg-slate-600'} ${!isEditMode && 'opacity-50 cursor-not-allowed'}`}
                   disabled={!isEditMode}
                 >
@@ -900,7 +1091,7 @@ export default function IoTDashboard() {
           <div className="text-xs text-slate-400 mb-3">
             {isEditMode ? (selectedDevice ? 'Drag & drop widgets to canvas' : 'Select a device first') : 'Enable Edit Mode to add widgets'}
           </div>
-          <div className="space-y-2">
+          <div className="space-y-2" onDragEnd={handleDragEnd}>
             <WidgetLibraryItem type="numeric" icon={Timer} label="Numeric Card" onDragStart={handleDragStart} isEditMode={isEditMode} />
             <WidgetLibraryItem type="gauge" icon={Gauge} label="Gauge" onDragStart={handleDragStart} isEditMode={isEditMode} />
             <WidgetLibraryItem type="chart" icon={BarChart3} label="Line Chart" onDragStart={handleDragStart} isEditMode={isEditMode} />
@@ -920,63 +1111,71 @@ export default function IoTDashboard() {
             <WidgetLibraryItem type="multi_metric" icon={BarChart3} label="Multi-Metric Widget" onDragStart={handleDragStart} isEditMode={isEditMode} />
             <WidgetLibraryItem type="pin_mapping" icon={Cpu} label="ESP32 Pin Mapping" onDragStart={handleDragStart} isEditMode={isEditMode} />
             <WidgetLibraryItem type="pin_reference" icon={CircuitBoard} label="ESP32 Pin Reference" onDragStart={handleDragStart} isEditMode={isEditMode} />
+            <WidgetLibraryItem type="machine_state" icon={Activity} label="Machine State" onDragStart={handleDragStart} isEditMode={isEditMode} />
           </div>
         </div>
       </div>
 
       {/* Main Content */}
       <div className="flex-1 flex flex-col overflow-hidden">
-        <div className={`border-b px-6 py-4 flex items-center justify-between shadow-sm ${isDarkMode ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'}`}>
-          <div className="flex items-center gap-4">
-            <LayoutGrid size={24} className={isDarkMode ? 'text-gray-400' : 'text-gray-600'} />
-            <div>
-              <h2 className={`text-xl font-semibold ${isDarkMode ? 'text-gray-100' : 'text-gray-800'}`}>Dashboard Canvas</h2>
-              {selectedDevice && <p className={`text-xs ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>Building dashboard for: {selectedDevice}</p>}
+        {/* Mobile-Responsive Toolbar */}
+        <div className={`border-b shadow-sm ${isDarkMode ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'}`}>
+          {/* Top Row - Title and Menu */}
+          <div className={`px-4 py-3 flex items-center justify-between ${isMobile ? 'border-b' : ''} ${isDarkMode ? 'border-gray-700' : 'border-gray-200'}`}>
+            <div className="flex items-center gap-3 min-w-0 flex-1">
+              {!isMobile && <LayoutGrid size={24} className={isDarkMode ? 'text-gray-400' : 'text-gray-600'} />}
+              <div className="min-w-0 flex-1">
+                <h2 className={`${isMobile ? 'text-lg' : 'text-xl'} font-semibold ${isDarkMode ? 'text-gray-100' : 'text-gray-800'} truncate`}>Dashboard Canvas</h2>
+                {selectedDevice && !isMobile && <p className={`text-xs ${isDarkMode ? 'text-gray-400' : 'text-gray-500'} truncate`}>Building dashboard for: {selectedDevice}</p>}
+              </div>
             </div>
-          </div>
 
-          <div className="flex items-center gap-3">
-            {/* Edit/View Mode Toggle */}
+            {/* Edit/View Mode Toggle - Always visible */}
             <button
               onClick={() => setIsEditMode(!isEditMode)}
-              className={`flex items-center gap-2 px-3 py-2 rounded-lg font-medium transition-colors ${isEditMode ? 'bg-blue-600 text-white' : isDarkMode ? 'bg-gray-700 text-gray-300 hover:bg-gray-600' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'}`}
+              className={`flex items-center gap-2 px-3 py-2 rounded-lg font-medium transition-colors flex-shrink-0 ${isEditMode ? 'bg-blue-600 text-white' : isDarkMode ? 'bg-gray-700 text-gray-300 hover:bg-gray-600' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'}`}
               title={isEditMode ? 'Switch to View Mode' : 'Switch to Edit Mode'}
             >
               {isEditMode ? <Unlock size={16} /> : <Lock size={16} />}
-              <span className="text-sm">{isEditMode ? 'Edit' : 'View'}</span>
+              {!isMobile && <span className="text-sm">{isEditMode ? 'Edit' : 'View'}</span>}
             </button>
+          </div>
 
-            {/* Undo/Redo */}
-            {isEditMode && (
-              <>
-                <button onClick={handleUndo} disabled={historyIndex === 0} className={`p-2 rounded ${historyIndex === 0 ? 'opacity-30 cursor-not-allowed' : isDarkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-200'}`} title="Undo">
-                  <Undo size={18} className={isDarkMode ? 'text-gray-400' : 'text-gray-600'} />
-                </button>
-                <button onClick={handleRedo} disabled={historyIndex === history.length - 1} className={`p-2 rounded ${historyIndex === history.length - 1 ? 'opacity-30 cursor-not-allowed' : isDarkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-200'}`} title="Redo">
-                  <Redo size={18} className={isDarkMode ? 'text-gray-400' : 'text-gray-600'} />
-                </button>
-              </>
-            )}
+          {/* Bottom Row - Controls (Scrollable on mobile) */}
+          <div className={`px-4 py-2 overflow-x-auto ${isMobile ? 'pb-3' : ''}`}>
+            <div className="flex items-center gap-2 min-w-max">
+              {/* Undo/Redo */}
+              {isEditMode && (
+                <>
+                  <button onClick={handleUndo} disabled={historyIndex === 0} className={`p-2 rounded ${historyIndex === 0 ? 'opacity-30 cursor-not-allowed' : isDarkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-200'}`} title="Undo">
+                    <Undo size={18} className={isDarkMode ? 'text-gray-400' : 'text-gray-600'} />
+                  </button>
+                  <button onClick={handleRedo} disabled={historyIndex === history.length - 1} className={`p-2 rounded ${historyIndex === history.length - 1 ? 'opacity-30 cursor-not-allowed' : isDarkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-200'}`} title="Redo">
+                    <Redo size={18} className={isDarkMode ? 'text-gray-400' : 'text-gray-600'} />
+                  </button>
+                </>
+              )}
 
-            {/* Save/Load */}
-            <button onClick={saveDashboard} className={`p-2 rounded ${isDarkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-200'}`} title="Save Dashboard">
-              <Save size={18} className={isDarkMode ? 'text-gray-400' : 'text-gray-600'} />
-            </button>
-            <button onClick={loadDashboard} className={`p-2 rounded ${isDarkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-200'}`} title="Load Dashboard">
-              <Upload size={18} className={isDarkMode ? 'text-gray-400' : 'text-gray-600'} />
-            </button>
+              {/* Save/Load */}
+              <button onClick={saveDashboard} className={`p-2 rounded ${isDarkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-200'}`} title="Save Dashboard">
+                <Save size={18} className={isDarkMode ? 'text-gray-400' : 'text-gray-600'} />
+              </button>
+              <button onClick={loadDashboard} className={`p-2 rounded ${isDarkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-200'}`} title="Load Dashboard">
+                <Upload size={18} className={isDarkMode ? 'text-gray-400' : 'text-gray-600'} />
+              </button>
 
-            {/* Dark Mode Toggle */}
-            <button onClick={() => setIsDarkMode(!isDarkMode)} className={`p-2 rounded ${isDarkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-200'}`} title={isDarkMode ? 'Light Mode' : 'Dark Mode'}>
-              {isDarkMode ? <Sun size={18} className="text-yellow-400" /> : <Moon size={18} className="text-gray-600" />}
-            </button>
+              {/* Dark Mode Toggle - Now visible on mobile */}
+              <button onClick={() => setIsDarkMode(!isDarkMode)} className={`p-2 rounded ${isDarkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-200'}`} title={isDarkMode ? 'Light Mode' : 'Dark Mode'}>
+                {isDarkMode ? <Sun size={18} className="text-yellow-400" /> : <Moon size={18} className="text-gray-600" />}
+              </button>
 
-            {/* Dashboard Selector */}
-            <div className="flex items-center gap-2 border-l pl-3" style={{ borderColor: isDarkMode ? '#374151' : '#e5e7eb' }}>
+              <div className={`w-px h-6 ${isDarkMode ? 'bg-gray-700' : 'bg-gray-300'}`}></div>
+
+              {/* Dashboard Selector - Compact on mobile */}
               <select
                 value={currentDashboardId}
                 onChange={(e) => switchDashboard(e.target.value)}
-                className={`px-3 py-2 rounded-lg text-sm font-medium border ${isDarkMode ? 'bg-gray-700 text-gray-200 border-gray-600' : 'bg-gray-100 text-gray-700 border-gray-300'}`}
+                className={`${isMobile ? 'px-2 py-1.5 text-xs' : 'px-3 py-2 text-sm'} rounded-lg font-medium border ${isDarkMode ? 'bg-gray-700 text-gray-200 border-gray-600' : 'bg-gray-100 text-gray-700 border-gray-300'}`}
                 title="Switch Dashboard"
               >
                 {dashboards.map(d => (
@@ -1014,26 +1213,30 @@ export default function IoTDashboard() {
                   </button>
                 </>
               )}
-            </div>
 
-            {/* Zoom Controls */}
-            <div className={`flex items-center gap-2 rounded-lg px-3 py-2 ${isDarkMode ? 'bg-gray-700' : 'bg-gray-100'}`}>
-              <button onClick={handleZoomOut} className={`p-1 rounded transition-colors ${isDarkMode ? 'hover:bg-gray-600' : 'hover:bg-gray-200'}`} title="Zoom Out">
-                <ZoomOut size={18} className={isDarkMode ? 'text-gray-300' : 'text-gray-700'} />
-              </button>
-              <span className={`text-sm font-medium min-w-[60px] text-center ${isDarkMode ? 'text-gray-300' : 'text-gray-700'}`}>
-                {(zoom * 100).toFixed(0)}%
-              </span>
-              <button onClick={handleZoomIn} className={`p-1 rounded transition-colors ${isDarkMode ? 'hover:bg-gray-600' : 'hover:bg-gray-200'}`} title="Zoom In">
-                <ZoomIn size={18} className={isDarkMode ? 'text-gray-300' : 'text-gray-700'} />
-              </button>
-              <button onClick={handleZoomReset} className={`ml-2 px-2 py-1 text-xs rounded transition-colors ${isDarkMode ? 'bg-gray-600 hover:bg-gray-500 text-gray-200' : 'bg-gray-200 hover:bg-gray-300 text-gray-700'}`} title="Reset Zoom">
-                Reset
-              </button>
-            </div>
+              <div className={`w-px h-6 ${isDarkMode ? 'bg-gray-700' : 'bg-gray-300'}`}></div>
 
-            <div className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-sm font-medium ${isConnected ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
-              {isConnected ? <><Wifi size={16} /><span>Connected</span></> : <><WifiOff size={16} /><span>Disconnected</span></>}
+              {/* Zoom Controls - Show on desktop only */}
+              {!isMobile && (
+                <div className={`flex items-center gap-2 rounded-lg px-3 py-2 ${isDarkMode ? 'bg-gray-700' : 'bg-gray-100'}`}>
+                  <button onClick={handleZoomOut} className={`p-1 rounded transition-colors ${isDarkMode ? 'hover:bg-gray-600' : 'hover:bg-gray-200'}`} title="Zoom Out">
+                    <ZoomOut size={18} className={isDarkMode ? 'text-gray-300' : 'text-gray-700'} />
+                  </button>
+                  <span className={`text-sm font-medium min-w-[60px] text-center ${isDarkMode ? 'text-gray-300' : 'text-gray-700'}`}>
+                    {(zoom * 100).toFixed(0)}%
+                  </span>
+                  <button onClick={handleZoomIn} className={`p-1 rounded transition-colors ${isDarkMode ? 'hover:bg-gray-600' : 'hover:bg-gray-200'}`} title="Zoom In">
+                    <ZoomIn size={18} className={isDarkMode ? 'text-gray-300' : 'text-gray-700'} />
+                  </button>
+                  <button onClick={handleZoomReset} className={`ml-2 px-2 py-1 text-xs rounded transition-colors ${isDarkMode ? 'bg-gray-600 hover:bg-gray-500 text-gray-200' : 'bg-gray-200 hover:bg-gray-300 text-gray-700'}`} title="Reset Zoom">
+                    Reset
+                  </button>
+                </div>
+              )}
+
+              <div className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-sm font-medium ${isConnected ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
+                {isConnected ? <><Wifi size={16} /><span>Connected</span></> : <><WifiOff size={16} /><span>Disconnected</span></>}
+              </div>
             </div>
           </div>
         </div>
@@ -1041,7 +1244,14 @@ export default function IoTDashboard() {
         <div
           ref={containerRef}
           className={`flex-1 overflow-auto ${isDarkMode ? 'bg-gray-900' : 'bg-gray-50'}`}
-          style={{ backgroundImage: `radial-gradient(circle, ${isDarkMode ? '#374151' : '#e5e7eb'} 1px, transparent 1px)`, backgroundSize: '20px 20px' }}
+          style={{
+            backgroundImage: `radial-gradient(circle, ${isDarkMode ? '#374151' : '#e5e7eb'} 1px, transparent 1px)`,
+            backgroundSize: '20px 20px',
+            // Custom scrollbar for better visibility on mobile
+            scrollbarWidth: 'thin',
+            scrollbarColor: `${isDarkMode ? '#3b82f6 #1f2937' : '#3b82f6 #e5e7eb'}`,
+            WebkitOverflowScrolling: 'touch', // Smooth scrolling on iOS
+          }}
           onDragOver={(e) => {
             if (!isEditMode) return;
             e.preventDefault();
@@ -1139,17 +1349,17 @@ export default function IoTDashboard() {
             <GridLayout
               className="layout"
               layout={layout}
-              cols={12}
-              rowHeight={60}
+              cols={isMobile ? 12 : 12}
+              rowHeight={isMobile ? 50 : 60}
               width={containerWidth}
               autoSize={true}
-              isDraggable={isEditMode}
+              isDraggable={!isMobile && isEditMode}
               isResizable={isEditMode}
               isDroppable={isEditMode}
-              droppingItem={{ i: '__dropping__', w: 4, h: 3, x: 0, y: 0 }}
-              compactType={null}
+              droppingItem={{ i: '__dropping__', w: isMobile ? 12 : 4, h: 3, x: 0, y: 0 }}
+              compactType={isMobile ? 'vertical' : null}
               preventCollision={false}
-              resizeHandles={['se', 'e', 's', 'sw']}
+              resizeHandles={isMobile ? ['s'] : ['se', 'e', 's', 'sw']}
               onDrop={onGridDrop}
               onLayoutChange={(newLayout) => {
                 if (!isEditMode) return;
@@ -1177,24 +1387,52 @@ export default function IoTDashboard() {
                 <div key={widget.id} className="relative group bg-transparent">
                   {isEditMode && (
                     <>
-                      <div className="drag-handle absolute top-2 left-2 z-10 cursor-move text-gray-400 opacity-0 group-hover:opacity-100 transition-opacity">
-                        <GripVertical size={16} />
+                      {!isMobile && (
+                        <div className="drag-handle absolute top-2 left-2 z-10 cursor-move text-gray-400 opacity-0 group-hover:opacity-100 transition-opacity">
+                          <GripVertical size={16} />
+                        </div>
+                      )}
+                      <div className={`absolute top-2 right-2 z-10 ${isMobile ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'} transition-opacity flex gap-1 ${isDarkMode ? 'bg-gray-900/90' : 'bg-white/90'} backdrop-blur-sm rounded-lg ${isMobile ? 'p-1.5' : 'p-1'} shadow-lg`}>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); setShowWidgetSettings(widget); }}
+                          onTouchEnd={(e) => { e.preventDefault(); e.stopPropagation(); setShowWidgetSettings(widget); }}
+                          className={`bg-blue-600 text-white ${isMobile ? 'p-2.5' : 'p-1.5'} rounded hover:bg-blue-700 transition-colors active:bg-blue-800`}
+                          title="Settings"
+                        >
+                          <Settings size={isMobile ? 18 : 14} />
+                        </button>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); duplicateWidget(widget); }}
+                          onTouchEnd={(e) => { e.preventDefault(); e.stopPropagation(); duplicateWidget(widget); }}
+                          className={`bg-green-600 text-white ${isMobile ? 'p-2.5' : 'p-1.5'} rounded hover:bg-green-700 transition-colors active:bg-green-800`}
+                          title="Duplicate"
+                        >
+                          <Copy size={isMobile ? 18 : 14} />
+                        </button>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); removeWidget(widget.id); }}
+                          onTouchEnd={(e) => { e.preventDefault(); e.stopPropagation(); removeWidget(widget.id); }}
+                          className={`bg-red-600 text-white ${isMobile ? 'p-2.5' : 'p-1.5'} rounded hover:bg-red-700 transition-colors active:bg-red-800`}
+                          title="Delete"
+                        >
+                          <Trash2 size={isMobile ? 18 : 14} />
+                        </button>
                       </div>
-                      <div className="absolute top-2 right-2 z-10 opacity-0 group-hover:opacity-100 transition-opacity flex gap-1">
-                        <button onClick={() => setShowWidgetSettings(widget)} className="bg-blue-600 text-white p-1.5 rounded" title="Settings">
-                          <Settings size={14} />
-                        </button>
-                        <button onClick={() => duplicateWidget(widget)} className="bg-green-600 text-white p-1.5 rounded" title="Duplicate">
-                          <Copy size={14} />
-                        </button>
-                        <button onClick={() => removeWidget(widget.id)} className="bg-red-600 text-white p-1.5 rounded" title="Delete">
-                          <Trash2 size={14} />
-                        </button>
-                      </div>
+
+                      {/* Mobile Resize Handle Indicator */}
+                      {isMobile && (
+                        <div className={`absolute bottom-0 left-0 right-0 h-10 flex items-center justify-center ${isDarkMode ? 'bg-blue-600/20 border-t-2 border-blue-500' : 'bg-blue-500/20 border-t-2 border-blue-500'} cursor-ns-resize`}>
+                          <div className="flex flex-col items-center gap-1">
+                            <div className="w-12 h-1.5 rounded-full bg-blue-500"></div>
+                            <div className="w-12 h-1.5 rounded-full bg-blue-500"></div>
+                            <div className={`text-xs font-medium ${isDarkMode ? 'text-blue-400' : 'text-blue-700'}`}>Drag to resize</div>
+                          </div>
+                        </div>
+                      )}
                     </>
                   )}
 
-                  <WidgetRenderer widget={widget} telemetryData={telemetryData} devices={devices} isDarkMode={isDarkMode} />
+                  <WidgetRenderer widget={widget} telemetryData={telemetryData} devices={devices} machineStates={machineStates} isDarkMode={isDarkMode} />
                 </div>
               ))}
             </GridLayout>

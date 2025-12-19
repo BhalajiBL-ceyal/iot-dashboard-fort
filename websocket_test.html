@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>WebSocket Test</title>
+    <style>
+        body {
+            font-family: monospace;
+            padding: 20px;
+            background: #1a1a1a;
+            color: #0f0;
+        }
+
+        #messages {
+            border: 1px solid #0f0;
+            padding: 10px;
+            height: 500px;
+            overflow-y: auto;
+            background: #000;
+        }
+
+        .message {
+            margin: 5px 0;
+            padding: 5px;
+            border-left: 3px solid #0f0;
+        }
+
+        .device {
+            color: #ff0;
+            font-weight: bold;
+        }
+
+        .timestamp {
+            color: #888;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>🔍 WebSocket Debug Monitor</h1>
+    <p>Status: <span id="status">Connecting...</span></p>
+    <p>Messages Received: <span id="count">0</span></p>
+    <h2>Live Messages:</h2>
+    <div id="messages"></div>
+
+    <script>
+        const ws = new WebSocket('ws://localhost:8000/ws/live');
+        const messagesDiv = document.getElementById('messages');
+        const statusSpan = document.getElementById('status');
+        const countSpan = document.getElementById('count');
+        let count = 0;
+
+        ws.onopen = () => {
+            statusSpan.textContent = '✅ Connected';
+            statusSpan.style.color = '#0f0';
+            addMessage('SYSTEM', 'WebSocket connected');
+        };
+
+        ws.onmessage = (event) => {
+            count++;
+            countSpan.textContent = count;
+
+            const data = JSON.parse(event.data);
+            console.log('Received:', data);
+
+            if (data.type === 'telemetry_update') {
+                const msg = document.createElement('div');
+                msg.className = 'message';
+                msg.innerHTML = `
+                    <span class="timestamp">[${new Date().toLocaleTimeString()}]</span>
+                    <span class="device">${data.device_id}</span>: 
+                    ${JSON.stringify(data.telemetry)}
+                `;
+                messagesDiv.insertBefore(msg, messagesDiv.firstChild);
+            } else {
+                addMessage('SYSTEM', JSON.stringify(data, null, 2));
+            }
+        };
+
+        ws.onerror = (error) => {
+            statusSpan.textContent = '❌ Error';
+            statusSpan.style.color = '#f00';
+            console.error('WebSocket error:', error);
+        };
+
+        ws.onclose = () => {
+            statusSpan.textContent = '⚠️ Disconnected';
+            statusSpan.style.color = '#fa0';
+            addMessage('SYSTEM', 'WebSocket disconnected');
+        };
+
+        function addMessage(type, content) {
+            const msg = document.createElement('div');
+            msg.className = 'message';
+            msg.innerHTML = `<span class="timestamp">[${new Date().toLocaleTimeString()}]</span> <span class="device">${type}</span>: ${content}`;
+            messagesDiv.insertBefore(msg, messagesDiv.firstChild);
+        }
+    </script>
+</body>
+
+</html>

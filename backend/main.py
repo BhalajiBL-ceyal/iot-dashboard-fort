@@ -17,6 +17,17 @@ from typing import Dict, List, Any, Optional
 from datetime import datetime
 import asyncio
 import json
+import paho.mqtt.client as mqtt
+import threading
+
+# Import state inference engine
+try:
+    from state_inference import inference_engine, MachineState
+    STATE_INFERENCE_ENABLED = True
+    print("[INFO] State inference engine loaded successfully")
+except ImportError as e:
+    STATE_INFERENCE_ENABLED = False
+    print(f"[WARNING] State inference module not found: {e}")
 
 # ==================== DATA MODELS ====================
 
@@ -173,6 +184,110 @@ class ConnectionManager:
             self.disconnect(conn)
 
 
+# ==================== MQTT MANAGER ====================
+
+class MQTTManager:
+    """
+    Manages MQTT broker subscription for ESP32 telemetry.
+    
+    Why: ESP32 devices publish telemetry to MQTT broker.
+    This manager subscribes to the broker and forwards data to WebSocket pipeline.
+    """
+    
+    def __init__(self, broker_host: str = "localhost", broker_port: int = 1883):
+        self.broker_host = broker_host
+        self.broker_port = broker_port
+        self.client = mqtt.Client(client_id="iot_dashboard_backend")
+        self.storage = None
+        self.ws_manager = None
+        self.loop = None  # Store the main event loop
+        
+        # MQTT Callbacks
+        self.client.on_connect = self._on_connect
+        self.client.on_message = self._on_message
+        
+        print(f"[MQTT] Initializing MQTT Manager (broker: {broker_host}:{broker_port})")
+    
+    def set_dependencies(self, storage, ws_manager, loop=None):
+        """Inject dependencies for storage, WebSocket manager, and event loop."""
+        self.storage = storage
+        self.ws_manager = ws_manager
+        self.loop = loop  # Store the main asyncio event loop
+    
+    def _on_connect(self, client, userdata, flags, rc):
+        """Callback when connected to MQTT broker."""
+        if rc == 0:
+            print(f"[MQTT] ✓ Connected to broker at {self.broker_host}:{self.broker_port}")
+            # Subscribe to telemetry topic with wildcard for device ID
+            client.subscribe("app/device/+/telemetry")
+            print("[MQTT] ✓ Subscribed to: app/device/+/telemetry")
+        else:
+            print(f"[MQTT] ✗ Connection failed with code {rc}")
+    
+    def _on_message(self, client, userdata, msg):
+        """
+        Callback when MQTT message received.
+        
+        Format: app/device/{device_id}/telemetry
+        Payload: JSON with telemetry data
+        """
+        try:
+            # Extract device_id from topic: app/device/ESP32_SIM_01/telemetry
+            topic_parts = msg.topic.split("/")
+            if len(topic_parts) != 4:
+                print(f"[MQTT] Invalid topic format: {msg.topic}")
+                return
+            
+            device_id = topic_parts[2]
+            
+            # Parse JSON payload
+            payload = json.loads(msg.payload.decode())
+            
+            # Expect format: {"telemetry": {...}, "timestamp": "..."}
+            telemetry = payload.get("telemetry", {})
+            timestamp = payload.get("timestamp", datetime.utcnow().isoformat())
+            
+            print(f"[MQTT] Received from {device_id}: {json.dumps(telemetry)}")
+            
+            # Forward to existing HTTP pipeline
+            if self.storage and self.ws_manager and self.loop:
+                # Auto-register device
+                self.storage.register_device(device_id)
+                
+                # Store telemetry
+                self.storage.update_telemetry(device_id, telemetry)
+                
+                # Broadcast to WebSocket clients using the main event loop
+                asyncio.run_coroutine_threadsafe(
+                    self.ws_manager.broadcast({
+                        "type": "telemetry_update",
+                        "device_id": device_id,
+                        "telemetry": telemetry,
+                        "timestamp": timestamp
+                    }),
+                    self.loop
+                )
+            
+        except json.JSONDecodeError:
+            print(f"[MQTT] Invalid JSON payload: {msg.payload}")
+        except Exception as e:
+            print(f"[MQTT] Error processing message: {e}")
+    
+    def start(self):
+        """Start MQTT client in background thread."""
+        def run_mqtt():
+            try:
+                self.client.connect(self.broker_host, self.broker_port, 60)
+                self.client.loop_forever()
+            except Exception as e:
+                print(f"[MQTT] Connection error: {e}")
+                print(f"[MQTT] Make sure MQTT broker is running on {self.broker_host}:{self.broker_port}")
+        
+        mqtt_thread = threading.Thread(target=run_mqtt, daemon=True)
+        mqtt_thread.start()
+        print("[MQTT] Background listener started")
+
+
 # ==================== APPLICATION SETUP ====================
 
 app = FastAPI(title="IoT Platform Backend", version="1.0.0")
@@ -190,19 +305,30 @@ app.add_middleware(
 storage = InMemoryStorage()
 ws_manager = ConnectionManager()
 
+# Initialize and start MQTT manager
+mqtt_manager = MQTTManager(broker_host="localhost", broker_port=1883)
+
+
+# Note: We'll set the event loop during startup
+async def set_mqtt_loop():
+    """Set the main event loop for MQTT manager."""
+    loop = asyncio.get_running_loop()
+    mqtt_manager.set_dependencies(storage, ws_manager, loop)
+
 
 # ==================== REST API ENDPOINTS ====================
 
 @app.post("/api/telemetry")
 async def receive_telemetry(payload: TelemetryPayload):
     """
-    Receive telemetry from any IoT device.
+    Receive telemetry from any IoT device and infer machine state.
     
     This is the main ingestion endpoint. It:
     1. Auto-registers new devices
     2. Auto-discovers new telemetry keys
-    3. Stores latest values
-    4. Broadcasts to all WebSocket clients
+    3. Infers machine state (RUNNING/IDLE/FAULT)
+    4. Stores latest values
+    5. Broadcasts to all WebSocket clients
     """
     device_id = payload.device_id
     telemetry = payload.telemetry
@@ -213,11 +339,26 @@ async def receive_telemetry(payload: TelemetryPayload):
     # Store telemetry
     storage.update_telemetry(device_id, telemetry)
     
+    # NEW: Infer machine state
+    telemetry_with_state = telemetry.copy()
+    if STATE_INFERENCE_ENABLED:
+        try:
+            state_info = inference_engine.update_telemetry(device_id, telemetry)
+            
+            # Add state to telemetry for broadcast
+            telemetry_with_state["_machine_state"] = state_info["state"]
+            telemetry_with_state["_state_confidence"] = state_info["confidence"]
+            telemetry_with_state["_state_reasons"] = state_info["reasons"]
+            
+            print(f"[STATE] {device_id}: {state_info['state']} ({state_info['confidence']}%)")
+        except Exception as e:
+            print(f"[ERROR] State inference failed for {device_id}: {e}")
+    
     # Broadcast to all connected dashboards
     await ws_manager.broadcast({
         "type": "telemetry_update",
         "device_id": device_id,
-        "telemetry": telemetry,
+        "telemetry": telemetry_with_state,
         "timestamp": payload.timestamp or datetime.utcnow().isoformat()
     })
     
@@ -233,6 +374,30 @@ async def get_devices():
     """
     devices = storage.get_devices()
     return {"devices": devices}
+
+
+@app.get("/api/devices/{device_id}/state")
+async def get_device_state(device_id: str):
+    """Get inferred machine state for a specific device."""
+    if not STATE_INFERENCE_ENABLED:
+        raise HTTPException(status_code=501, detail="State inference not enabled")
+    
+    state_info = inference_engine.get_device_state(device_id)
+    
+    if not state_info:
+        raise HTTPException(status_code=404, detail="Device not found or no state data")
+    
+    return state_info
+
+
+@app.get("/api/states")
+async def get_all_states():
+    """Get machine states for all devices."""
+    if not STATE_INFERENCE_ENABLED:
+        return {}
+    
+    return inference_engine.get_all_states()
+
 
 
 @app.get("/api/devices/{device_id}")
@@ -321,6 +486,13 @@ async def root():
 @app.on_event("startup")
 async def startup_event():
     """Run background tasks on startup."""
+    # Set the event loop for MQTT manager first
+    await set_mqtt_loop()
+    
+    # Start MQTT listener
+    mqtt_manager.start()
+    
+    # Start device status checker
     asyncio.create_task(check_device_status())
 
 
